@@ -23,9 +23,10 @@ def main():
     print("="*50)
     print("  CoC Bot Calibrator")
     print("="*50)
-    print("1) Calibrate Deploy Points (for troops/spells)")
+    print("1) Calibrate Deploy Points (for troops/heroes)")
     print("2) Calibrate Loot Regions (Gold/Elixir OCR boxes)")
-    choice = input("\nEnter 1 or 2: ")
+    print("3) Calibrate Spell Drop Points (Lightning / Rage / Freeze)")
+    choice = input("\nEnter 1, 2, or 3: ")
     
     if choice.strip() == '2':
         print("\n" + "="*50)
@@ -36,6 +37,47 @@ def main():
         print("Copy and paste this into coc_bot.py (around line 54):\n")
         print(f"GOLD_REGION   = {gold}")
         print(f"ELIXIR_REGION = {elixir}")
+        print("="*50)
+
+    elif choice.strip() == '3':
+        print("\n" + "="*50)
+        print("Calibrate spell drop points during an attack preview.")
+        print("Hover each target and press Enter. Type 'q' when done with a list.")
+        print("="*50)
+
+        def collect_points(label):
+            print(f"\n--- {label} ---")
+            pts = []
+            while True:
+                user_input = input(
+                    f"  {label} point {len(pts)+1} "
+                    f"(Enter to save, 'q' to finish): "
+                )
+                if user_input.strip().lower() == 'q':
+                    break
+                x, y = pyautogui.position()
+                pts.append((x, y))
+                print(f"    [+] ({x}, {y})")
+            return pts
+
+        lightning = collect_points("LIGHTNING (air-defense cluster)")
+        rage      = collect_points("RAGE (on troop funnel)")
+        freeze    = collect_points("FREEZE (any defense in red zone)")
+
+        print("\n" + "="*50)
+        print("Copy and paste into coc_bot.py:\n")
+        print("LIGHTNING_POINTS = [")
+        for pt in lightning:
+            print(f"    {pt},")
+        print("]")
+        print("\nRAGE_FUNNEL_POINTS = [")
+        for pt in rage:
+            print(f"    {pt},")
+        print("]")
+        print("\nFREEZE_POINTS = [")
+        for pt in freeze:
+            print(f"    {pt},")
+        print("]")
         print("="*50)
         
     else:
