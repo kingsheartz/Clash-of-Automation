@@ -419,6 +419,49 @@ def debug_cards():
             card_is_active(card)
         )
 
+def get_spell_count(card):
+
+    img = get_troop_bar()
+
+    x, y, w, h = card
+
+    roi = img[y:y+h, x:x+w]
+
+    # bottom-right area where x8/x1 is shown
+    count_roi = roi[int(h*0.60):h, int(w*0.55):w]
+
+    gray = cv2.cvtColor(
+        count_roi,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    gray = cv2.resize(
+        gray,
+        None,
+        fx=4,
+        fy=4,
+        interpolation=cv2.INTER_CUBIC
+    )
+
+    _, thresh = cv2.threshold(
+        gray,
+        140,
+        255,
+        cv2.THRESH_BINARY
+    )
+
+    text = pytesseract.image_to_string(
+        thresh,
+        config="--psm 7"
+    )
+
+    m = re.search(r'(\d+)', text)
+
+    if m:
+        return int(m.group(1))
+
+    return 1
+
 def deploy_all():
 
     focus_game()
@@ -490,22 +533,37 @@ def deploy_all():
         time.sleep(0.1)
 
     # ------------------
-    # SPELLS
-    # ------------------
+		# SPELLS
+		# ------------------
 
     print("[*] Casting spells...")
 
+    CENTER_SPELL_POINTS = [
+				(1524, 784),
+				(1560, 760),
+				(1490, 820),
+				(1600, 800),
+		]
+
     for spell in spells:
+
+        count = get_spell_count(spell)
+
+        print(f"Spell count = {count}")
 
         click_card(spell)
 
-        for point in SPELL_POINTS:
+        for i in range(count):
+
+            point = CENTER_SPELL_POINTS[
+                i % len(CENTER_SPELL_POINTS)
+            ]
 
             pydirectinput.moveTo(*point)
             pydirectinput.mouseDown(*point)
             pydirectinput.mouseUp(*point)
 
-            time.sleep(0.5)
+            time.sleep(0.25)
 
     # ------------------
     # HERO ABILITIES
