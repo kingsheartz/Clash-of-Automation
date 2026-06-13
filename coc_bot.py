@@ -144,16 +144,16 @@ def find_button(template_path, confidence=MATCH_CONFIDENCE):
         return None
 
 
-def click(pos, delay=1.2):
+def click(pos, delay=0.5):
     pydirectinput.moveTo(pos[0], pos[1])
-    time.sleep(0.1)
+    time.sleep(0.05)
     pydirectinput.mouseDown(pos[0], pos[1])
-    time.sleep(0.1)
+    time.sleep(0.05)
     pydirectinput.mouseUp(pos[0], pos[1])
     time.sleep(delay)
 
 
-def wait_for(template_path, timeout=45, interval=1.5):
+def wait_for(template_path, timeout=45, interval=0.5):
     """Block until template appears; return its position or None."""
     t = 0
     while t < timeout:
@@ -267,24 +267,24 @@ def focus_game():
     Adjust (700, 30) if the top bar is in a different position.
     """
     pydirectinput.moveTo(700, 30)
-    time.sleep(0.1)
+    time.sleep(0.05)
     pydirectinput.mouseDown(700, 30)
-    time.sleep(0.1)
+    time.sleep(0.05)
     pydirectinput.mouseUp(700, 30)
-    time.sleep(0.5)
+    time.sleep(0.1)
 
 
 def click_card(card):
     cx, cy = card_center(card)
 
     pydirectinput.moveTo(cx, cy)
-    time.sleep(0.05)
+    time.sleep(0.02)
 
     pydirectinput.mouseDown(cx, cy)
-    time.sleep(0.05)
+    time.sleep(0.02)
     pydirectinput.mouseUp(cx, cy)
 
-    time.sleep(0.2)
+    time.sleep(0.05)
 
 def get_battle_cards():
     cards = detect_cards()
@@ -487,7 +487,7 @@ def deploy_all():
         pydirectinput.mouseDown(*point)
         pydirectinput.mouseUp(*point)
 
-        time.sleep(0.5)
+        time.sleep(0.1)
 
     # ------------------
     # SPELLS
@@ -505,15 +505,15 @@ def deploy_all():
             pydirectinput.mouseDown(*point)
             pydirectinput.mouseUp(*point)
 
-            time.sleep(0.1)
+            time.sleep(0.5)
 
     # ------------------
     # HERO ABILITIES
     # ------------------
 
-    print("[*] Waiting 30s...")
+    print("[*] Waiting 5s...")
 
-    time.sleep(30)
+    time.sleep(5)
 
     for hero in heroes:
 
@@ -564,16 +564,16 @@ def run():
                 return_home = wait_for(
                     "templates/return_home.png",
                     timeout=30,
-                    interval=1
+                    interval=0.5
                 )
 
                 if return_home:
-                    click(return_home, delay=4.0)
+                    click(return_home, delay=1.0)
                 else:
                     print("  [!] Return Home not found")
             else:
                 print("  [-] Skipping base...")
-                click(next_btn, delay=3.0)
+                click(next_btn, delay=1.0)
                 skips += 1
             continue
 
@@ -581,27 +581,27 @@ def run():
         home_btn = find_button("templates/attack_initialize_btn.png")
         if home_btn:
             print("  [State] At Home Village. Starting matchmaking...")
-            click(home_btn, delay=2.0)
+            click(home_btn, delay=1.0)
             match_btn = wait_for("templates/find_match_btn.png", timeout=10)
             if match_btn:
-                click(match_btn, delay=3.0)
+                click(match_btn, delay=1.0)
 
             # Just in case there is a green confirm button (some events)
             attack_confirm = find_button("templates/attack_btn.png")
             if attack_confirm:
-                click(attack_confirm, delay=3.0)
+                click(attack_confirm, delay=1.0)
             continue
 
         # State 3: Battle Ended (Return Home button is visible)
         return_home = find_button("templates/return_home.png")
         if return_home:
             print("  [State] Post-battle. Returning home...")
-            click(return_home, delay=4.0)
+            click(return_home, delay=1.0)
             continue
 
         # Unknown State
-        print("  [!] Unknown state (Cannot find Home, Next, or Return buttons). Waiting 5s...")
-        time.sleep(5)
+        print("  [!] Unknown state (Cannot find Home, Next, or Return buttons). Waiting 2s...")
+        time.sleep(2)
 
 if __name__ == "__main__":
     try:
