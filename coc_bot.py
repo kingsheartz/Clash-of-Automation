@@ -1,28 +1,19 @@
 """
 Clash of Clans - Event Attack Automation v3
 Platform: Windows native (Google Play Games)
-Screen: High-DPI display (effective 2732x1536 with 2x scaling)
 
 HOW CARD DETECTION WORKS:
-  1. Capture the troop bar region (TROOP_BAR_REGION)
-  2. Split into fixed slots using CARD_WIDTH spacing
-  3. Classify each slot:
-       - Has xN count in top + blue background  → TROOP
-       - Has xN count in top + non-blue bg      → SPELL
-       - No xN count                            → HERO
-  4. Track count remaining per troop/spell card
-  5. Click card to select, then click deploy points
+  1. Capture the troop bar strip (TROOP_BAR_REGION)
+  2. Slide each template across the bar — the bar is center-aligned and
+     grows outward with army size, so slot X positions are never fixed
+  3. Cluster peaks, crop each card, portrait-match to confirm identity
+  4. Deploy until card greys out — never use OCR counts
 
-DEPLOY LOGIC:
-  - Troops: deploy until card greyed-out (disabled view)
-  - Heroes: click card once → click border point → activate ability after 15s
-  - Lightning: first, on air-defense cluster (LIGHTNING_POINTS)
-  - Rage: mid troop deploy, on funnel path where troops are walking
-  - Freeze: last, on defenses (FREEZE_POINTS)
-
-Install:
-  pip install pyautogui pydirectinput opencv-python pytesseract Pillow
-  + Tesseract: https://github.com/UB-Mannheim/tesseract/wiki
+DEPLOY LOGIC (fully dynamic — any army with templates/ PNGs):
+  - Heroes: once each, by template name
+  - Lightning: zap AD cluster until spell card disabled
+  - Troops: deploy until disabled; rage mid-funnel
+  - Freeze: drop on defenses until disabled
 """
 
 import cv2
@@ -33,7 +24,8 @@ import pyautogui
 import time
 import re
 import sys
-from collections import Counter
+import os
+import glob
 from PIL import ImageGrab, Image
 
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -46,24 +38,36 @@ MIN_GOLD   = 1_000_000
 MIN_ELIXIR = 500_000
 
 MATCH_CONFIDENCE = 0.75
+CARD_MATCH_CONFIDENCE = 0.40
+CARD_MATCH_MARGIN = 0.02   # best template must beat 2nd place in same slot
+CARD_SCAN_MIN_SCORE = 0.48 # minimum peak score to accept a bar position
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATE_ROOT = os.path.join(SCRIPT_DIR, "templates")
+TEMPLATE_DIRS = {
+    "TROOP": os.path.join(TEMPLATE_ROOT, "troops"),
+    "HERO":  os.path.join(TEMPLATE_ROOT, "heroes"),
+    "SPELL": os.path.join(TEMPLATE_ROOT, "spells"),
+}
 
 # Set True to save OCR/card debug images and verbose scan logs
 DEBUG = False
+
+_CARD_TEMPLATES = None
 
 # ── Loot OCR ─────────────────────────────────────────────────
 GOLD_REGION   = (238, 246, 328, 72)
 ELIXIR_REGION = (235, 326, 323, 65)
 
 # ── Troop Bar ─────────────────────────────────────────────────
-# The full region containing all troop/hero/spell cards
+# Wide capture band — cards are found dynamically (center-aligned bar).
 # Format: (screen_left, screen_top, capture_width, capture_height)
-TROOP_BAR_REGION = (232, 1467, 2748, 210)  # Only capture top 210px (card area)
+TROOP_BAR_REGION = (232, 1467, 2748, 210)
 
-# Card layout within the captured bar image
-CARD_X_STARTS  = [232, 421, 610, 799, 988, 1177, 1366, 1555, 1744, 1933]
 CARD_WIDTH     = 185
 CARD_HEIGHT    = 210
 CARD_CENTER_Y  = 105   # vertical center within card
+CARD_SLOT_GAP  = 0.55  # min separation between peaks, as fraction of CARD_WIDTH
 
 # Screen Y of card centers (TROOP_BAR_REGION top + card center)
 CARD_SCREEN_Y  = 1467 + CARD_CENTER_Y  # = 1572
@@ -79,20 +83,11 @@ DEPLOY_POINTS = [
     (1819, 1425), (2001, 1284), (2048, 1244), (2173, 1153),
 ]
 
-# Spell drop points — calibrate with calibrate.py option 3
-# Army spell order: Lightning @ 1555, Rage @ 1744, Freeze @ 1933
-
-SPELL_SLOTS = {
-    1555: "lightning",
-    1744: "rage",
-    1933: "freeze",
-}
-
-# Fallback when spell badge OCR fails (rage x1 often reads as bare 'x')
-SPELL_DEFAULT_COUNTS = {
-    1555: 8,
-    1744: 1,
-    1933: 1,
+# Per-hero deploy points on the base border
+HERO_DEPLOY_POINTS = {
+    "barbarian_king": DEPLOY_POINTS[0],
+    "grand_warden":   DEPLOY_POINTS[8],
+    "archer_queen":   DEPLOY_POINTS[16],
 }
 
 # Lightning x8 → 4 air defenses (diagonal cluster), 2 spells each
@@ -242,176 +237,332 @@ def capture_bar():
     return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
 
-def read_count(card_img):
-    """
-    OCR the xN badge from the card's top header strip.
-    Runs several preprocess passes — a single crop/threshold
-    is not reliable across troops, spells, and digit widths.
-    """
+def load_card_templates():
+    """Load troop/hero/spell portrait templates from templates/."""
+
+    global _CARD_TEMPLATES
+    if _CARD_TEMPLATES is not None:
+        return _CARD_TEMPLATES
+
+    templates = []
+    for card_type, folder in TEMPLATE_DIRS.items():
+        for path in glob.glob(os.path.join(folder, "*.png")):
+            img = cv2.imread(path, cv2.IMREAD_COLOR)
+            if img is None:
+                print(f"  [!] Could not load template: {path}")
+                continue
+            name = os.path.splitext(os.path.basename(path))[0]
+            templates.append({
+                "name": name,
+                "type": card_type,
+                "img": img,
+                "path": path,
+            })
+
+    _CARD_TEMPLATES = templates
+    return templates
+
+
+def portrait_roi(card_img):
+    """Match on the portrait body, not the xN badge (count varies)."""
 
     h, w = card_img.shape[:2]
-
-    # Badge lives in the thin header bar only; taller crops pull in
-    # troop portraits and destroy tesseract accuracy.
-    passes = [
-        (0.18, 0.38, 10, 200, False, 7),
-        (0.20, 0.35, 8,  180, False, 8),
-        (0.18, 0.38, 10, 200, True,  8),
-        (0.20, 0.40, 8,  150, False, 7),
-        (0.22, 0.35, 8,  180, False, 8),
-        (0.20, 0.35, 12, 180, False, 7),
-        (0.18, 0.52, 12, 170, False, 8),  # x1 spells: badge sits far right
-        (0.16, 0.55, 12, 180, False, 7),
+    return card_img[
+        int(h * 0.18):int(h * 0.92),
+        int(w * 0.05):int(w * 0.95),
     ]
 
-    counts = []
-    raws = []
-    debug_thresh = None
 
-    for hfrac, wfrac, scale, thresh_val, invert, psm in passes:
-        roi = card_img[0:int(h * hfrac), int(w * wfrac):w]
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        gray = cv2.resize(
-            gray, None, fx=scale, fy=scale,
-            interpolation=cv2.INTER_CUBIC
+def portrait_gray(card_img):
+    """Grayscale portrait used for matching — ignores xN badge."""
+
+    return cv2.cvtColor(portrait_roi(card_img), cv2.COLOR_BGR2GRAY)
+
+
+def _rank_templates(card_img):
+    """Return [(score, template_dict), ...] sorted best-first."""
+
+    templates = load_card_templates()
+    if not templates:
+        return []
+
+    rois = [
+        portrait_gray(card_img),
+        cv2.cvtColor(card_img, cv2.COLOR_BGR2GRAY),
+    ]
+    ranked = []
+
+    for tmpl in templates:
+        t_portrait = portrait_gray(
+            cv2.resize(tmpl["img"], (CARD_WIDTH, CARD_HEIGHT))
         )
-        flag = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
-        _, thresh = cv2.threshold(gray, thresh_val, 255, flag)
-        raw = pytesseract.image_to_string(
-            thresh,
-            config=f"--psm {psm} -c tessedit_char_whitelist=xX0123456789"
-        ).strip()
-        raws.append(raw)
-
-        m = re.search(r"[xX]+(\d+)", raw)
-        if m:
-            counts.append(int(m.group(1)))
-            if DEBUG and debug_thresh is None:
-                debug_thresh = thresh
-
-    if DEBUG and debug_thresh is not None:
-        cv2.imwrite(
-            f"count_debug_{int(time.time()*1000)}.png",
-            debug_thresh
+        t_full = cv2.cvtColor(
+            cv2.resize(tmpl["img"], (CARD_WIDTH, CARD_HEIGHT)),
+            cv2.COLOR_BGR2GRAY,
         )
+        best_score = 0.0
+        for roi in rois:
+            rh, rw = roi.shape[:2]
+            for t_roi in (t_portrait, t_full):
+                for scale in (0.94, 1.0, 1.06):
+                    sw = max(12, int(rw * scale))
+                    sh = max(12, int(rh * scale))
+                    t_resized = cv2.resize(t_roi, (sw, sh))
+                    if t_resized.shape[0] > rh or t_resized.shape[1] > rw:
+                        continue
+                    result = cv2.matchTemplate(
+                        roi, t_resized, cv2.TM_CCOEFF_NORMED
+                    )
+                    best_score = max(best_score, float(result.max()))
+        ranked.append((best_score, tmpl))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return ranked
+
+
+def _best_template_guess(card_img):
+    ranked = _rank_templates(card_img)
+    return ranked[0][1]["name"] if ranked else None
+
+
+def identify_card(card_img):
+    """
+    Match a single slot crop to the best template.
+    Returns (name, type, confidence) or (None, None, best_score).
+    """
+
+    ranked = _rank_templates(card_img)
+    if not ranked or ranked[0][0] < CARD_MATCH_CONFIDENCE:
+        return None, None, ranked[0][0] if ranked else 0.0
+
+    second_score = ranked[1][0] if len(ranked) > 1 else 0.0
+    if ranked[0][0] - second_score < CARD_MATCH_MARGIN:
+        return None, None, ranked[0][0]
+
+    best = ranked[0][1]
+    return best["name"], best["type"], ranked[0][0]
+
+
+def _resize_card(img, bar_h):
+    """Normalize a template/card image to standard slot dimensions."""
+
+    return cv2.resize(img, (CARD_WIDTH, bar_h))
+
+
+def _template_peak_on_bar(bar_strip, tmpl_img):
+    """
+    Find the best horizontal position for one template on the bar.
+    Returns (bar_x, score).
+    """
+
+    bar_h = bar_strip.shape[0]
+    sized = _resize_card(tmpl_img, bar_h)
+    bar_gray = cv2.cvtColor(bar_strip, cv2.COLOR_BGR2GRAY)
+    tmpl_views = [
+        cv2.cvtColor(sized, cv2.COLOR_BGR2GRAY),
+        portrait_gray(sized),
+    ]
+
+    best_x = 0
+    best_score = 0.0
+
+    for tmpl_gray in tmpl_views:
+        if tmpl_gray.shape[0] > bar_h or tmpl_gray.shape[1] > bar_strip.shape[1]:
+            continue
+        result = cv2.matchTemplate(
+            bar_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED
+        )
+        _, score, _, loc = cv2.minMaxLoc(result)
+        if score > best_score:
+            best_score = float(score)
+            best_x = int(loc[0])
+
+    return best_x, best_score
+
+
+def scan_bar_positions(bar):
+    """
+    Locate card columns by sliding every template across the bar.
+    The troop bar grows from screen-center as army size changes.
+    """
+
+    bar_h = min(CARD_HEIGHT, bar.shape[0])
+    bar_strip = bar[0:bar_h, :]
+    min_sep = int(CARD_WIDTH * CARD_SLOT_GAP)
+    peaks = []
+
+    for tmpl in load_card_templates():
+        bar_x, score = _template_peak_on_bar(bar_strip, tmpl["img"])
+        if score < CARD_SCAN_MIN_SCORE:
+            continue
+        peaks.append({
+            "bar_x": bar_x,
+            "score": score,
+            "name": tmpl["name"],
+            "type": tmpl["type"],
+        })
+
+    peaks.sort(key=lambda p: p["score"], reverse=True)
+
+    accepted = []
+    for peak in peaks:
+        if any(
+            abs(peak["bar_x"] - slot["bar_x"]) < min_sep
+            for slot in accepted
+        ):
+            continue
+        accepted.append(peak)
+
+    accepted.sort(key=lambda p: p["bar_x"])
 
     if DEBUG:
-        print(f"OCR RAW={raws}")
+        for peak in peaks[:15]:
+            mark = "✓" if peak in accepted else "·"
+            print(
+                f"  [scan] {mark} {peak['name']:16s} "
+                f"bar_x={peak['bar_x']} score={peak['score']:.2f}"
+            )
 
-    if counts:
-        return Counter(counts).most_common(1)[0][0]
-
-    return 0
-
-
-def resolve_spell_count(bar_x, ocr_count):
-    """Use OCR count when available, else known army defaults."""
-    if ocr_count > 0:
-        return ocr_count
-    return SPELL_DEFAULT_COUNTS.get(bar_x, 1)
+    return accepted
 
 
-def classify_card(card_img, count):
+def crop_card(bar, bar_x):
+    """Crop one card column from the captured bar."""
+
+    bar_h = min(CARD_HEIGHT, bar.shape[0])
+    x1 = max(0, bar_x)
+    x2 = min(bar.shape[1], bar_x + CARD_WIDTH)
+    if x2 - x1 < CARD_WIDTH // 2:
+        return None
+    return bar[0:bar_h, x1:x2]
+
+
+def _template_by_name(name):
+    for tmpl in load_card_templates():
+        if tmpl["name"] == name:
+            return tmpl
+    return None
+
+
+def refine_card_crop(bar, bar_x, radius=16):
     """
-    Classify by the top header strip — troops/spells have a flat
-    coloured bar with the xN badge; heroes are portrait-only.
+    Small horizontal search — scan peaks can be a few px off the
+    true slot edge, which tanks crop-only match scores.
     """
 
-    h, w = card_img.shape[:2]
-    top_hsv = cv2.cvtColor(
-        card_img[0:int(h * 0.20), :],
-        cv2.COLOR_BGR2HSV
-    )
+    best_img = None
+    best_x = bar_x
+    best_score = -1.0
 
-    top_blue = np.count_nonzero(
-        cv2.inRange(top_hsv, (90, 60, 60), (130, 255, 255))
-    )
-    top_purple = np.count_nonzero(
-        cv2.inRange(top_hsv, (120, 40, 40), (170, 255, 255))
-    )
+    for dx in range(-radius, radius + 1, 2):
+        card_img = crop_card(bar, bar_x + dx)
+        if card_img is None:
+            continue
+        ranked = _rank_templates(card_img)
+        if not ranked:
+            continue
+        if ranked[0][0] > best_score:
+            best_score = ranked[0][0]
+            best_img = card_img
+            best_x = bar_x + dx
 
-    has_header = top_blue > 4000
+    if best_img is None:
+        return crop_card(bar, bar_x), bar_x
 
-    if count > 0 or has_header:
-        if top_purple > 3000:
-            return "SPELL"
-        return "TROOP"
+    return best_img, best_x
 
-    return "HERO"
+
+def resolve_card_identity(card_img, slot):
+    """
+    Identify a card crop. Fall back to the bar-scan attribution when
+    the crop match is weak but the full-bar scan was confident.
+    """
+
+    ranked = _rank_templates(card_img)
+    if ranked:
+        name, card_type, score = identify_card(card_img)
+        if name is not None:
+            return name, card_type, score
+
+    scan_name = slot.get("name")
+    scan_score = slot.get("score", 0.0)
+    scan_type = slot.get("type")
+    scan_rank = 0.0
+
+    if scan_name and ranked:
+        for score, tmpl in ranked:
+            if tmpl["name"] == scan_name:
+                scan_rank = score
+                break
+
+    if scan_name and scan_score >= CARD_SCAN_MIN_SCORE:
+        if scan_rank >= 0.35 or (
+            ranked and ranked[0][1]["name"] == scan_name
+        ):
+            return scan_name, scan_type, max(scan_score, scan_rank)
+
+    if ranked and ranked[0][0] >= CARD_MATCH_CONFIDENCE:
+        second_score = ranked[1][0] if len(ranked) > 1 else 0.0
+        if ranked[0][0] - second_score >= CARD_MATCH_MARGIN:
+            best = ranked[0][1]
+            return best["name"], best["type"], ranked[0][0]
+
+    return None, None, ranked[0][0] if ranked else 0.0
 
 
 def detect_all_cards():
+    """
+    Find cards on the center-aligned troop bar via template scan,
+    then confirm each crop with identify_card().
+    """
 
     bar = capture_bar()
-
     cards = []
 
-    for bar_x in CARD_X_STARTS:
-
-        if bar_x + CARD_WIDTH > bar.shape[1]:
+    for slot in scan_bar_positions(bar):
+        bar_x = slot["bar_x"]
+        card_img, bar_x = refine_card_crop(bar, bar_x)
+        if card_img is None:
             continue
 
-        card_img = bar[
-            0:CARD_HEIGHT,
-            bar_x:bar_x+CARD_WIDTH
-        ]
-
         if DEBUG:
-            cv2.imwrite(
-                f"debug_slot_{bar_x}.png",
-                card_img
-            )
+            cv2.imwrite(f"debug_slot_{bar_x}.png", card_img)
 
-        mean_brightness = np.mean(
-            cv2.cvtColor(
-                card_img,
-                cv2.COLOR_BGR2GRAY
-            )
-        )
-
-        if mean_brightness < 20:
+        if np.mean(cv2.cvtColor(card_img, cv2.COLOR_BGR2GRAY)) < 20:
             continue
 
-        count = read_count(card_img)
-
-        card_type = classify_card(
-            card_img,
-            count
-        )
-
-        if card_type == "SPELL":
-            count = resolve_spell_count(bar_x, count)
-
-        screen_x = (
-            TROOP_BAR_REGION[0]
-            + bar_x
-            + CARD_WIDTH // 2
-        )
-
-        screen_y = CARD_SCREEN_Y
-
-        if DEBUG:
+        name, card_type, score = resolve_card_identity(card_img, slot)
+        if name is None:
+            guess = _best_template_guess(card_img)
+            guess_txt = f", guess={guess}" if guess else ""
             print(
-                f"SLOT={bar_x} "
-                f"COUNT={count} "
-                f"TYPE={card_type}"
+                f"  [!] Unknown card bar_x={bar_x} "
+                f"(best={score:.2f}{guess_txt})"
             )
+            continue
+
+        screen_x = TROOP_BAR_REGION[0] + bar_x + CARD_WIDTH // 2
 
         cards.append({
+            "name": name,
             "type": card_type,
-            "count": count,
             "screen_x": screen_x,
-            "screen_y": screen_y,
+            "screen_y": CARD_SCREEN_Y,
             "bar_x": bar_x,
+            "match_conf": score,
         })
+
+    if not cards:
+        print("  [!] No cards matched — check templates/ folder")
 
     return cards
 
 
 def card_is_disabled(card_img):
     """
-    Fully deployed troop/spell cards turn grey and lose their
-    coloured header bar. Heroes grey out too but lack the x0 badge.
+    Fully deployed troop/spell cards turn grey and dim.
+    Dark event troops (e.g. lavaloon) stay desaturated while active,
+    so rely on overall brightness — not header colour or saturation alone.
     """
 
     h, w = card_img.shape[:2]
@@ -425,21 +576,27 @@ def card_is_disabled(card_img):
     mean_sat = np.mean(
         cv2.cvtColor(card_img, cv2.COLOR_BGR2HSV)[:, :, 1]
     )
+    mean_val = np.mean(
+        cv2.cvtColor(card_img, cv2.COLOR_BGR2GRAY)
+    )
 
-    # Active troops/spells: saturated portrait + blue/purple header.
-    # Disabled: grey card, header bar gone (top_blue was ~5000).
-    return top_blue < 1500 and mean_sat < 80
+    return (
+        mean_val < 62
+        or (
+            mean_val < 78
+            and mean_sat < 38
+            and top_blue < 600
+        )
+    )
 
 
 def card_is_exhausted(card):
 
     bar = capture_bar()
     bar_x = card["bar_x"]
-
-    card_img = bar[
-        0:CARD_HEIGHT,
-        bar_x:bar_x + CARD_WIDTH
-    ]
+    card_img = crop_card(bar, bar_x)
+    if card_img is None:
+        return True
 
     return card_is_disabled(card_img)
 
@@ -489,7 +646,7 @@ def deploy_troops(troops, rage_card=None):
 
         print(
             f"  [>] Deploying troop "
-            f"bar_x={card['bar_x']}"
+            f"{card['name']} bar_x={card['bar_x']}"
         )
 
         deselect()
@@ -497,7 +654,7 @@ def deploy_troops(troops, rage_card=None):
         time.sleep(0.2)
 
         if card_is_exhausted(card):
-            print("    already disabled — skipping")
+            print("    already exhausted — skipping")
             continue
 
         deployed = 0
@@ -534,6 +691,41 @@ def deploy_troops(troops, rage_card=None):
         cast_rage(rage_card)
 
 
+def cast_spell_until_exhausted(card, points, delay=0.35, reselect_every=2, cap=30):
+    """Cast a spell on rotating points until the card greys out."""
+
+    print(f"  [>] Casting {card['name']} until disabled")
+
+    deselect()
+    select_card(card)
+    time.sleep(0.3)
+
+    if card_is_exhausted(card):
+        print(f"    {card['name']} already exhausted — skipping")
+        return
+
+    casts = 0
+    pt_idx = 0
+
+    while not card_is_exhausted(card):
+        if casts > 0 and casts % reselect_every == 0:
+            select_card(card)
+            time.sleep(0.25)
+
+        pt = points[pt_idx % len(points)]
+        raw_click(pt[0], pt[1])
+        time.sleep(delay)
+        casts += 1
+        pt_idx += 1
+
+        if casts >= cap:
+            print(f"    [!] safety cap ({cap}) reached")
+            break
+
+    print(f"    disabled after {casts} casts")
+    time.sleep(0.2)
+
+
 def cast_rage(rage_card):
     """Drop rage on the troop funnel while troops are moving in."""
 
@@ -541,8 +733,7 @@ def cast_rage(rage_card):
 
     print(
         f"  [>] Casting rage on funnel "
-        f"bar_x={rage_card['bar_x']} "
-        f"-> ({pt[0]},{pt[1]})"
+        f"{rage_card['name']} -> ({pt[0]},{pt[1]})"
     )
 
     time.sleep(RAGE_CAST_DELAY)
@@ -554,75 +745,37 @@ def cast_rage(rage_card):
 
 
 def cast_lightning(lightning_card):
-
-    count = SPELL_DEFAULT_COUNTS[1555]
-
-    print(
-        f"  [>] Casting lightning "
-        f"bar_x={lightning_card['bar_x']} x{count}"
+    cast_spell_until_exhausted(
+        lightning_card,
+        LIGHTNING_POINTS,
+        delay=0.4,
+        reselect_every=2,
+        cap=12,
     )
-
-    deselect()
-    select_card(lightning_card)
-    time.sleep(0.3)
-
-    for i in range(count):
-        if i > 0 and i % 2 == 0:
-            select_card(lightning_card)
-            time.sleep(0.25)
-
-        pt = LIGHTNING_POINTS[i % len(LIGHTNING_POINTS)]
-        raw_click(pt[0], pt[1])
-        time.sleep(0.4)
-
-    time.sleep(0.3)
 
 
 def deploy_freeze(freeze_cards):
 
     for card in freeze_cards:
-
-        bar_x = card["bar_x"]
-        count = resolve_spell_count(bar_x, card["count"])
-
-        print(
-            f"  [>] Casting freeze "
-            f"bar_x={bar_x} x{count}"
+        cast_spell_until_exhausted(
+            card,
+            FREEZE_POINTS,
+            delay=0.2,
+            reselect_every=1,
+            cap=5,
         )
-
-        deselect()
-        select_card(card)
-        time.sleep(0.3)
-
-        for i in range(count):
-            pt = FREEZE_POINTS[i % len(FREEZE_POINTS)]
-            raw_click(pt[0], pt[1])
-            time.sleep(0.2)
-
-        time.sleep(0.3)
 
 def deploy_heroes(heroes):
 
-    hero_points = [
-        DEPLOY_POINTS[0],
-        DEPLOY_POINTS[8],
-        DEPLOY_POINTS[16],
-    ]
-
-    hero_names = {
-        988: "King",
-        1177: "Warden",
-        1366: "Queen",
-    }
-
     for idx, card in enumerate(heroes):
 
-        pt = hero_points[idx % len(hero_points)]
-        name = hero_names.get(card["bar_x"], f"hero{idx}")
+        pt = HERO_DEPLOY_POINTS.get(
+            card["name"],
+            DEPLOY_POINTS[idx % len(DEPLOY_POINTS)],
+        )
 
         print(
-            f"  [>] Deploying {name} "
-            f"bar_x={card['bar_x']} "
+            f"  [>] Deploying {card['name']} "
             f"-> ({pt[0]},{pt[1]})"
         )
 
@@ -631,18 +784,21 @@ def deploy_heroes(heroes):
         select_card(card)
         time.sleep(0.4)
 
+        if card_is_exhausted(card):
+            print(f"    {card['name']} already deployed — skipping")
+            continue
+
         raw_click(pt[0], pt[1])
         time.sleep(0.5)
 
 def deploy_spells(spells):
     """Legacy wrapper — prefer cast_lightning / cast_rage / deploy_freeze."""
     for card in spells:
-        kind = SPELL_SLOTS.get(card["bar_x"], "spell")
-        if kind == "lightning":
+        if card["name"] == "lightning":
             cast_lightning(card)
-        elif kind == "rage":
+        elif card["name"] == "rage":
             cast_rage(card)
-        elif kind == "freeze":
+        elif card["name"] == "freeze":
             deploy_freeze([card])
 
 
@@ -663,32 +819,24 @@ def deploy_all():
 
     cards = detect_all_cards()
 
-    troops = [
-        c for c in cards
-        if c["type"] == "TROOP"
-    ]
-
-    heroes = [
-        c for c in cards
-        if c["type"] == "HERO"
-    ]
-
-    spells = [
-        c for c in cards
-        if c["type"] == "SPELL"
-    ]
-
-    lightning = next(
-        (c for c in spells if SPELL_SLOTS.get(c["bar_x"]) == "lightning"),
-        None,
+    troops = sorted(
+        [c for c in cards if c["type"] == "TROOP"],
+        key=lambda c: c["bar_x"],
     )
-    rage = next(
-        (c for c in spells if SPELL_SLOTS.get(c["bar_x"]) == "rage"),
-        None,
+
+    heroes = sorted(
+        [c for c in cards if c["type"] == "HERO"],
+        key=lambda c: c["bar_x"],
     )
-    freeze_cards = [
-        c for c in spells if SPELL_SLOTS.get(c["bar_x"]) == "freeze"
-    ]
+
+    spells = sorted(
+        [c for c in cards if c["type"] == "SPELL"],
+        key=lambda c: c["bar_x"],
+    )
+
+    lightning = next((c for c in spells if c["name"] == "lightning"), None)
+    rage = next((c for c in spells if c["name"] == "rage"), None)
+    freeze_cards = [c for c in spells if c["name"] == "freeze"]
 
     print(
         f"  [*] Detected: "
@@ -698,10 +846,9 @@ def deploy_all():
     )
 
     for c in cards:
-
         print(
-            f"      {c['type']:6s} "
-            f"count={c['count']:2d} "
+            f"      {c['type']:6s} {c['name']:16s} "
+            f"conf={c['match_conf']:.2f} "
             f"screen=({c['screen_x']},{c['screen_y']})"
         )
 
