@@ -40,7 +40,7 @@ Use `Win + Shift + S` to take **tight screenshots** (snip just the button itself
 | `find_match_btn.png` | Matchmaking Screen | The "Find a Match" button (showing the gold coin cost) |
 | `attack_btn.png` | Confirm Attack | The green "Attack!" confirm button |
 | `next_btn.png` | Enemy Base | The "Next" button to skip a base |
-| `battle_end.png` | Battle Complete | The red "End Battle" button |
+| `end_battle.png` | End Battle | The red "End Battle" button |
 | `return_home.png` | Battle Complete | The green "Return Home" button |
 
 ## 3. Calibrate OCR (Loot Detection)

@@ -11,8 +11,9 @@ HOW CARD DETECTION WORKS:
 
 DEPLOY LOGIC (fully dynamic — any army with templates/ PNGs):
   - Heroes: once each, by template name
-  - Lightning: zap AD cluster until spell card disabled
-  - Troops: deploy until disabled; rage mid-funnel
+  - Lightning: zap air defences first, then eagle artillery (templates/defence/)
+  - Healer: deploys immediately after archer queen, left of her spot
+  - Troops: deploy until disabled; rage mid-funnel (after lightning)
   - Freeze: drop on defenses until disabled
 """
 
@@ -38,6 +39,13 @@ MIN_GOLD   = 1_000_000
 MIN_ELIXIR = 500_000
 
 MATCH_CONFIDENCE = 0.75
+DEFENCE_MATCH_CONFIDENCE = 0.38
+DEFENCE_EDGE_CONFIDENCE = 0.32
+DEFENCE_MATCH_SCALES = [
+    0.45, 0.55, 0.65, 0.75, 0.85, 0.95,
+    1.05, 1.20, 1.40, 1.60, 1.85, 2.10,
+]
+DEFENCE_MIN_DISTANCE = 60
 CARD_MATCH_CONFIDENCE = 0.40
 CARD_MATCH_MARGIN = 0.02   # best template must beat 2nd place in same slot
 CARD_SCAN_MIN_SCORE = 0.48 # minimum peak score to accept a bar position
@@ -49,6 +57,7 @@ TEMPLATE_DIRS = {
     "HERO":  os.path.join(TEMPLATE_ROOT, "heroes"),
     "SPELL": os.path.join(TEMPLATE_ROOT, "spells"),
 }
+DEFENCE_DIR = os.path.join(TEMPLATE_ROOT, "defence")
 
 # Set True to save OCR/card debug images and verbose scan logs
 DEBUG = False
@@ -90,7 +99,18 @@ HERO_DEPLOY_POINTS = {
     "archer_queen":   DEPLOY_POINTS[16],
 }
 
-# Lightning x8 → 4 air defenses (diagonal cluster), 2 spells each
+# Healer drops just left of the archer queen deploy point
+HEALER_LEFT_OFFSET = 90
+
+# Base area to search for defence buildings (above the troop bar)
+BASE_SEARCH_REGION = (280, 160, 2320, 1280)
+
+# Lightning: 2 zaps per detected air defence, then cycle targets
+LIGHTNING_ZAPS_PER_AD = 2
+LIGHTNING_ZAPS_EAGLE = 4
+AIR_DEFENCE_MATCH_CONFIDENCE = 0.40
+
+# Fallback when template matching finds nothing on screen
 LIGHTNING_POINTS = [
     (1410, 795), (1415, 800),   # AD 1
     (1495, 855), (1500, 860),   # AD 2
@@ -98,14 +118,15 @@ LIGHTNING_POINTS = [
     (1665, 975), (1670, 980),   # AD 4
 ]
 
-# Rage → troop funnel path (border → base); cast mid-deploy while troops move
+# Rage → drop inside the funnel (not on the outer deploy ring)
+RAGE_CAST_POINT = (1680, 1020)
 RAGE_FUNNEL_POINTS = [
     (1920, 1387),   # deploy edge — where troops land
     (1850, 1250),   # just inside border
     (1750, 1100),   # troop blob as they walk in
 ]
 RAGE_DEPLOY_AFTER_CLICKS = 6   # cast rage after this many troop clicks
-RAGE_CAST_DELAY = 1.5          # extra wait so troops have moved into funnel
+RAGE_CAST_DELAY = 1.0          # troops already walking — shorter wait
 
 # Freeze → any defense inside the red-border zone; cycles if count > 1
 FREEZE_POINTS = [
@@ -119,6 +140,18 @@ SPELL_POINTS = FREEZE_POINTS
 
 # Safe failsafe exclusion zone — don't move mouse within this margin of screen edge
 FAILSAFE_MARGIN = 50
+
+BATTLE_POLL_INTERVAL = 0.25   # how often to check for battle end
+RETURN_HOME_CLICK_DELAY = 0.5
+
+# Victory screen UI — stable crops from battle_end.png (loot numbers vary per attack)
+VICTORY_BANNER_TEMPLATE = os.path.join(TEMPLATE_ROOT, "victory_banner.png")
+RETURN_HOME_BTN_TEMPLATE = os.path.join(TEMPLATE_ROOT, "return_home.png")
+BATTLE_UI_CONFIDENCE = 0.60
+BATTLE_UI_SCALES = [0.85, 0.95, 1.0, 1.05, 1.15]
+
+# Fallback click when victory banner is visible
+RETURN_HOME_POINT = (1440, 1580)
 
 # ─────────────────────────────────────────────────────────────
 # SAFETY
@@ -145,6 +178,193 @@ def safe_coords(x, y):
 def screenshot():
     img = ImageGrab.grab()
     return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+
+def _defence_gray(img):
+    """Contrast-normalised grey — less sensitive to AD level colours."""
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(gray)
+
+
+def _defence_edges(gray):
+    """Rocket + base silhouette — works across AD levels."""
+
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    return cv2.Canny(blur, 35, 110)
+
+
+def _collect_defence_peaks(
+    region,
+    template,
+    tw,
+    th,
+    left,
+    top,
+    passes,
+):
+    """Run one or more match passes and collect all peaks above threshold."""
+
+    peaks = []
+
+    for matcher, min_score in passes:
+        work = matcher.copy()
+        while True:
+            _, score, _, loc = cv2.minMaxLoc(work)
+            if score < min_score:
+                break
+
+            peaks.append((
+                left + loc[0] + tw // 2,
+                top + loc[1] + th // 2,
+                float(score),
+            ))
+
+            x1, y1 = loc[0], loc[1]
+            work[y1:y1 + th, x1:x1 + tw] = 0
+
+    return peaks
+
+
+def find_defence_matches(template_path, confidence=DEFENCE_MATCH_CONFIDENCE):
+    """
+    Find defences by structure (edges) and colour across many scales.
+    Edge matching tolerates different air-defence level palettes.
+    """
+
+    template = cv2.imread(template_path, cv2.IMREAD_COLOR)
+    if template is None:
+        print(f"  [!] Missing template: {template_path}")
+        return []
+
+    screen = screenshot()
+    left, top, rw, rh = BASE_SEARCH_REGION
+    region = screen[top:top + rh, left:left + rw]
+    region_gray = _defence_gray(region)
+    region_edge = _defence_edges(region_gray)
+
+    candidates = []
+
+    for scale in DEFENCE_MATCH_SCALES:
+        tw = max(16, int(template.shape[1] * scale))
+        th = max(16, int(template.shape[0] * scale))
+        if th > region.shape[0] or tw > region.shape[1]:
+            continue
+
+        scaled = cv2.resize(template, (tw, th))
+        t_edge = _defence_edges(_defence_gray(scaled))
+
+        passes = (
+            (cv2.matchTemplate(region, scaled, cv2.TM_CCOEFF_NORMED), confidence),
+            (cv2.matchTemplate(region_edge, t_edge, cv2.TM_CCOEFF_NORMED),
+                DEFENCE_EDGE_CONFIDENCE),
+        )
+        candidates.extend(
+            _collect_defence_peaks(
+                region, scaled, tw, th, left, top, passes
+            )
+        )
+
+    candidates.sort(key=lambda c: c[2], reverse=True)
+
+    accepted = []
+    for cx, cy, score in candidates:
+        if any(
+            abs(cx - ax) < DEFENCE_MIN_DISTANCE
+            and abs(cy - ay) < DEFENCE_MIN_DISTANCE
+            for ax, ay, _ in accepted
+        ):
+            continue
+        accepted.append((cx, cy, score))
+
+    if DEBUG and not accepted:
+        cv2.imwrite("debug_base_search.png", region)
+    elif DEBUG and accepted:
+        dbg = region.copy()
+        for cx, cy, score in accepted:
+            cv2.circle(
+                dbg,
+                (cx - left, cy - top),
+                20,
+                (0, 255, 0),
+                2,
+            )
+        cv2.imwrite("debug_air_defence.png", dbg)
+
+    return accepted
+
+
+def resolve_lightning_targets():
+    """
+    Build zap points from template-matched air defences.
+    Searches BASE_SEARCH_REGION at 12 scales (colour + edges).
+    Falls back to calibrated LIGHTNING_POINTS only when nothing matches.
+    """
+
+    points = []
+    ad_path = os.path.join(DEFENCE_DIR, "air_defence.png")
+
+    print("  [*] Scanning air defences...")
+    t0 = time.time()
+    ads = find_defence_matches(
+        ad_path,
+        confidence=AIR_DEFENCE_MATCH_CONFIDENCE,
+    )
+    elapsed = time.time() - t0
+
+    for cx, cy, score in ads:
+        print(
+            f"  [v] air_defence @ ({cx},{cy})  conf={score:.2f}"
+        )
+        for _ in range(LIGHTNING_ZAPS_PER_AD):
+            points.append((cx, cy))
+
+    if not points:
+        print(
+            f"  [!] No ADs found in {elapsed:.1f}s — "
+            "using calibrated LIGHTNING_POINTS"
+        )
+        return LIGHTNING_POINTS
+
+    print(f"  [+] Found {len(ads)} AD(s) in {elapsed:.1f}s")
+    return points
+
+
+def healer_point_left_of_queen(queen_pt):
+    """Deploy healer slightly left of the archer queen border drop."""
+
+    return (queen_pt[0] - HEALER_LEFT_OFFSET, queen_pt[1])
+
+
+def deploy_healer(healer_card, queen_pt):
+    """Deploy all healers left of the archer queen drop point."""
+
+    pt = healer_point_left_of_queen(queen_pt)
+    print(
+        f"  [>] Deploying healer after queen "
+        f"-> ({pt[0]},{pt[1]})"
+    )
+
+    deselect()
+    select_card(healer_card)
+    time.sleep(0.2)
+
+    if card_is_exhausted(healer_card):
+        print("    healer already exhausted — skipping")
+        return
+
+    deployed = 0
+    while not card_is_exhausted(healer_card):
+        raw_click(pt[0], pt[1])
+        time.sleep(0.05)
+        deployed += 1
+        if deployed >= 200:
+            print("    [!] safety cap reached")
+            break
+
+    print(f"    disabled after {deployed} clicks")
+    time.sleep(0.2)
 
 
 def find_button(template_path, confidence=MATCH_CONFIDENCE):
@@ -605,16 +825,134 @@ def card_is_exhausted(card):
 # BATTLE CHECK
 # ─────────────────────────────────────────────────────────────
 
+def _match_template_in_roi(screen, template_path, roi, confidence=BATTLE_UI_CONFIDENCE):
+    """
+    Multi-scale match within a screen region.
+    Returns ((cx, cy), score) or (None, best_score).
+    """
+
+    template = cv2.imread(template_path, cv2.IMREAD_COLOR)
+    if template is None:
+        print(f"  [!] Missing template: {template_path}")
+        return None, 0.0
+
+    left, top, rw, rh = roi
+    region = screen[top:top + rh, left:left + rw]
+    best_score = 0.0
+    best_center = None
+
+    for scale in BATTLE_UI_SCALES:
+        tw = max(10, int(template.shape[1] * scale))
+        th = max(10, int(template.shape[0] * scale))
+        if th > region.shape[0] or tw > region.shape[1]:
+            continue
+
+        scaled = cv2.resize(template, (tw, th))
+        result = cv2.matchTemplate(region, scaled, cv2.TM_CCOEFF_NORMED)
+        _, score, _, loc = cv2.minMaxLoc(result)
+        if score > best_score:
+            best_score = float(score)
+            best_center = (
+                left + loc[0] + tw // 2,
+                top + loc[1] + th // 2,
+            )
+
+    if best_score >= confidence and best_center:
+        return best_center, best_score
+
+    return None, best_score
+
+
+def find_return_home_click(screen=None):
+    """Locate the green Return Home button on the victory screen."""
+
+    if screen is None:
+        screen = screenshot()
+
+    h, w = screen.shape[:2]
+    top = int(h * 0.58)
+    roi = (0, top, w, h - top)
+
+    pos, score = _match_template_in_roi(
+        screen, RETURN_HOME_BTN_TEMPLATE, roi
+    )
+    if pos:
+        print(
+            f"  [v] return_home @ ({pos[0]},{pos[1]})  "
+            f"conf={score:.2f}"
+        )
+        return pos
+
+    return None
+
+
+def is_victory_banner_visible(screen=None, quiet=False):
+    """Victory ribbon / stars at the top of the end-battle screen."""
+
+    if screen is None:
+        screen = screenshot()
+
+    h, w = screen.shape[:2]
+    roi = (0, 0, w, int(h * 0.40))
+
+    pos, score = _match_template_in_roi(
+        screen, VICTORY_BANNER_TEMPLATE, roi
+    )
+    if pos and not quiet:
+        print(
+            f"  [v] victory_banner @ ({pos[0]},{pos[1]})  "
+            f"conf={score:.2f}"
+        )
+        return True
+
+    return pos is not None
+
+
+def is_battle_end_screen(screen=None):
+    """True when victory UI or Return Home button is visible."""
+
+    if screen is None:
+        screen = screenshot()
+
+    h, w = screen.shape[:2]
+
+    btn, _ = _match_template_in_roi(
+        screen,
+        RETURN_HOME_BTN_TEMPLATE,
+        (0, int(h * 0.58), w, h - int(h * 0.58)),
+    )
+    if btn:
+        return True
+
+    banner, _ = _match_template_in_roi(
+        screen,
+        VICTORY_BANNER_TEMPLATE,
+        (0, 0, w, int(h * 0.40)),
+    )
+    return banner is not None
+
+
+def find_return_home():
+    """
+    Return Home click position on the victory screen.
+    end_battle.png is intentionally unused (visible during live battles).
+    """
+
+    screen = screenshot()
+    home = find_return_home_click(screen)
+    if home:
+        return home
+
+    if is_victory_banner_visible(screen):
+        return RETURN_HOME_POINT
+
+    return None
+
+
 def battle_over():
-    """
-    Battle is over only when the Return Home screen appears.
-    The End Battle button is visible during active battles,
-    so it must never be used as a completion signal.
-    """
-    return find_button(
-        "templates/return_home.png",
-        confidence=0.85
-    ) is not None
+    """Battle finished when victory UI appears."""
+
+    return is_battle_end_screen()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -636,7 +974,7 @@ def deploy_troops(troops, rage_card=None):
 
     """
     Deploy troops one click at a time until disabled.
-    Casts rage mid-deploy once troops are walking into the base.
+    Healer is handled separately in deploy_heroes().
     """
 
     rage_cast = False
@@ -691,7 +1029,7 @@ def deploy_troops(troops, rage_card=None):
         cast_rage(rage_card)
 
 
-def cast_spell_until_exhausted(card, points, delay=0.35, reselect_every=2, cap=30):
+def cast_spell_until_exhausted(card, points, delay=0.35, reselect_every=2):
     """Cast a spell on rotating points until the card greys out."""
 
     print(f"  [>] Casting {card['name']} until disabled")
@@ -718,21 +1056,17 @@ def cast_spell_until_exhausted(card, points, delay=0.35, reselect_every=2, cap=3
         casts += 1
         pt_idx += 1
 
-        if casts >= cap:
-            print(f"    [!] safety cap ({cap}) reached")
-            break
-
     print(f"    disabled after {casts} casts")
     time.sleep(0.2)
 
 
 def cast_rage(rage_card):
-    """Drop rage on the troop funnel while troops are moving in."""
+    """Drop rage inside the troop funnel — not on the outer deploy ring."""
 
-    pt = RAGE_FUNNEL_POINTS[1]
+    pt = RAGE_CAST_POINT
 
     print(
-        f"  [>] Casting rage on funnel "
+        f"  [>] Casting rage in funnel "
         f"{rage_card['name']} -> ({pt[0]},{pt[1]})"
     )
 
@@ -745,12 +1079,12 @@ def cast_rage(rage_card):
 
 
 def cast_lightning(lightning_card):
+    points = resolve_lightning_targets()
     cast_spell_until_exhausted(
         lightning_card,
-        LIGHTNING_POINTS,
-        delay=0.4,
+        points,
+        delay=0.35,
         reselect_every=2,
-        cap=12,
     )
 
 
@@ -762,10 +1096,12 @@ def deploy_freeze(freeze_cards):
             FREEZE_POINTS,
             delay=0.2,
             reselect_every=1,
-            cap=5,
         )
 
-def deploy_heroes(heroes):
+def deploy_heroes(heroes, healer_card=None):
+
+    deployed = {}
+    healer_done = False
 
     for idx, card in enumerate(heroes):
 
@@ -780,16 +1116,34 @@ def deploy_heroes(heroes):
         )
 
         deselect()
-        time.sleep(0.1)
+        time.sleep(0.05)
         select_card(card)
-        time.sleep(0.4)
+        time.sleep(0.15)
 
         if card_is_exhausted(card):
             print(f"    {card['name']} already deployed — skipping")
+            if card["name"] == "archer_queen" and healer_card and not healer_done:
+                queen_pt = HERO_DEPLOY_POINTS["archer_queen"]
+                deploy_healer(healer_card, queen_pt)
+                healer_done = True
             continue
 
         raw_click(pt[0], pt[1])
-        time.sleep(0.5)
+        deployed[card["name"]] = pt
+        time.sleep(0.15)
+
+        if card["name"] == "archer_queen" and healer_card and not healer_done:
+            deploy_healer(healer_card, pt)
+            healer_done = True
+
+    if healer_card and not healer_done:
+        queen_pt = deployed.get(
+            "archer_queen",
+            HERO_DEPLOY_POINTS["archer_queen"],
+        )
+        deploy_healer(healer_card, queen_pt)
+
+    return deployed
 
 def deploy_spells(spells):
     """Legacy wrapper — prefer cast_lightning / cast_rage / deploy_freeze."""
@@ -803,14 +1157,16 @@ def deploy_spells(spells):
 
 
 def activate_hero_abilities(heroes):
-    """
-    After troops are deployed and 15s have passed,
-    click each hero card again to activate their ability.
-    """
+    """Click each hero card again to activate their ability."""
+
+    if is_battle_end_screen():
+        print("  [*] Battle over — skipping hero abilities")
+        return
+
     print("  [>] Activating hero abilities...")
     for card in heroes:
         select_card(card)
-        time.sleep(0.3)
+        time.sleep(0.15)
 
 
 def deploy_all():
@@ -823,6 +1179,8 @@ def deploy_all():
         [c for c in cards if c["type"] == "TROOP"],
         key=lambda c: c["bar_x"],
     )
+    healer_card = next((c for c in troops if c["name"] == "healer"), None)
+    troops = [c for c in troops if c["name"] != "healer"]
 
     heroes = sorted(
         [c for c in cards if c["type"] == "HERO"],
@@ -861,11 +1219,11 @@ def deploy_all():
     deselect()
 
     print("  [*] Deploying heroes...")
-    deploy_heroes(heroes)
+    hero_positions = deploy_heroes(heroes, healer_card=healer_card)
 
     deselect()
     if lightning:
-        print("  [*] Casting lightning on air defenses...")
+        print("  [*] Casting lightning on defences...")
         cast_lightning(lightning)
 
     deselect()
@@ -877,20 +1235,9 @@ def deploy_all():
         print("  [*] Casting freeze on defenses...")
         deploy_freeze(freeze_cards)
 
-    print(
-        "  [*] Waiting 20s "
-        "before hero abilities..."
-    )
+    activate_hero_abilities(heroes)
 
-    time.sleep(20)
-
-    activate_hero_abilities(
-        heroes
-    )
-
-    print(
-        "  [*] Deployment complete!"
-    )
+    print("  [*] Deployment complete!")
 
     return True
 
@@ -917,8 +1264,7 @@ def run():
         if next_btn:
             print("  [State] Scouting base...")
             if MIN_GOLD == 0 and MIN_ELIXIR == 0 or loot_ok():
-                print("  [+] Loot OK — attacking!")
-                time.sleep(1)
+                print("  [+] Loot OK — deploying!")
                 success = deploy_all()
                 if success:
                     attacks += 1
@@ -928,18 +1274,27 @@ def run():
                     )
                     continue
 
-                # Wait for battle to end
+                # Wait for battle to end, then click Return Home immediately
                 print("  [~] Waiting for battle to finish...")
                 deadline = time.time() + 240
+                home = None
                 while time.time() < deadline:
-                    if battle_over():
+                    screen = screenshot()
+                    home = find_return_home_click(screen)
+                    if home:
                         print("  [+] Battle finished!")
                         break
-                    time.sleep(1)
+                    if is_victory_banner_visible(screen, quiet=True):
+                        home = RETURN_HOME_POINT
+                        print(
+                            "  [+] Victory screen — "
+                            f"clicking Return Home @ {home}"
+                        )
+                        break
+                    time.sleep(BATTLE_POLL_INTERVAL)
 
-                home = wait_for("templates/return_home.png", timeout=30)
                 if home:
-                    click(home, delay=2.0)
+                    click(home, delay=RETURN_HOME_CLICK_DELAY)
                 else:
                     print("  [!] Return Home not found")
             else:
@@ -962,10 +1317,10 @@ def run():
             continue
 
         # ── State: Post-battle ────────────────────────────────
-        return_home = find_button("templates/return_home.png")
+        return_home = find_return_home()
         if return_home:
             print("  [State] Post-battle — returning home...")
-            click(return_home, delay=2.0)
+            click(return_home, delay=RETURN_HOME_CLICK_DELAY)
             continue
 
         # ── Unknown state ─────────────────────────────────────
@@ -977,5 +1332,5 @@ if __name__ == "__main__":
     try:
         run()
     except KeyboardInterrupt:
-        print("\n[Stopped by user]")
+        print("\n[Stopped by user]", flush=True)
         sys.exit(0)
